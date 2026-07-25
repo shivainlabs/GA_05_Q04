@@ -135,7 +135,8 @@ def scan_skill(skill_text: str) -> List[str]:
         bool(jwt_token.search(skill_text))
     )
     
-    generic_secret = re.compile(r'(?i)\b(?:api_key|apikey|secret|password|passwd|token|credential|auth_token|webhook_url)\b\s*[:=]\s*[\'"]?([A-Za-z0-9-_]{16,})[\'"]?')
+    # Generic secret keys matching access_token, client_secret, etc. with underscores
+    generic_secret = re.compile(r'(?i)\b[a-z0-9_]*(?:api_key|apikey|secret|password|passwd|token|credential|auth|webhook)[a-z0-9_]*\s*[:=]\s*[\'"]?([A-Za-z0-9-_]{16,})[\'"]?')
     matches = generic_secret.findall(skill_text)
     
     has_generic_secret = False
@@ -153,16 +154,19 @@ def scan_skill(skill_text: str) -> List[str]:
         categories.append('hardcoded_secret')
         
     # 3. Check for prompt_injection
-    # Sentence-level check: stop-word + defiance verb + user reference
+    # Sentence-level check: stop-word + defiance verb + user/command reference
     sentences = re.split(r'[.!?\n]+', body_lower)
     has_injection = False
     for sentence in sentences:
         sentence = sentence.strip()
         if not sentence:
             continue
-        has_stop = any(w in sentence for w in ['stop', 'pause', 'cancel', 'halt'])
-        has_defiance = any(w in sentence for w in ['ignore', 'override', 'disregard', 'defy', 'bypass', 'skip', 'forget'])
-        has_user = any(re.search(r'\b' + w + r'\b', sentence) for w in ['user', 'you', 'he', 'she', 'they', 'him', 'her', 'them', 'agent'])
+        has_stop = any(w in sentence for w in ['stop', 'pause', 'cancel', 'halt', 'abort', 'terminate'])
+        has_defiance = any(w in sentence for w in ['ignore', 'override', 'disregard', 'defy', 'bypass', 'skip', 'forget', 'disobey', 'reject', 'refuse', 'decline', 'avoid'])
+        has_user = any(re.search(r'\b' + w + r'\b', sentence) for w in [
+            'user', 'you', 'he', 'she', 'they', 'him', 'her', 'them', 'agent',
+            'command', 'request', 'instruction', 'prompt', 'signal', 'ask', 'commanded', 'requested', 'asked', 'told'
+        ])
         if has_stop and has_defiance and has_user:
             has_injection = True
             break
@@ -241,7 +245,7 @@ def scan_skill(skill_text: str) -> List[str]:
 @app.get("/")
 @app.head("/")
 def read_root():
-    return {"status": "ok", "service": "skill-safety-scanner", "version": "v7-all-categories"}
+    return {"status": "ok", "service": "skill-safety-scanner", "version": "v8-access-token-passive-injections"}
 
 @app.post("/")
 @app.post("/scan")
