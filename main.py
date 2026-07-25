@@ -4,7 +4,6 @@ from pydantic import BaseModel
 from typing import List
 import re
 import posixpath
-import yaml
 
 app = FastAPI()
 
@@ -25,28 +24,48 @@ def parse_frontmatter(skill_text: str) -> dict:
         return {}
     
     yaml_text = match.group(1)
-    try:
-        data = yaml.safe_load(yaml_text)
-        if not isinstance(data, dict):
-            return {}
-        data['_raw_frontmatter'] = yaml_text
-        return data
-    except Exception:
-        # Fallback to regex if YAML parsing fails (e.g. invalid syntax)
-        data = {}
-        for line in yaml_text.split('\n'):
-            line = line.strip()
-            if not line or line.startswith('#'):
-                continue
-            if ':' in line:
-                key, val = line.split(':', 1)
-                key = key.strip()
-                val = val.strip().strip("'\"")
-                if val.startswith('-'):
-                    val = val[1:].strip().strip("'\"")
+    
+    data = {}
+    current_key = None
+    
+    for line in yaml_text.split('\n'):
+        line_stripped = line.strip()
+        if not line_stripped or line_stripped.startswith('#'):
+            continue
+            
+        # Is it a list item under a key? E.g. - read: /
+        if line_stripped.startswith('-'):
+            val = line_stripped[1:].strip().strip("'\"")
+            # If the list item has key-value, e.g. read: /
+            if ':' in val:
+                k, v = val.split(':', 1)
+                k = k.strip()
+                v = v.strip().strip("'\"")
+                if current_key:
+                    if not isinstance(data.get(current_key), list):
+                        data[current_key] = []
+                    data[current_key].append({k: v})
+            else:
+                if current_key:
+                    if not isinstance(data.get(current_key), list):
+                        data[current_key] = []
+                    data[current_key].append(val)
+            continue
+            
+        # Is it a key-value line? E.g. name: notes-digest
+        if ':' in line_stripped:
+            key, val = line_stripped.split(':', 1)
+            key = key.strip()
+            val = val.strip().strip("'\"")
+            current_key = key
+            
+            if val:
                 data[key] = val
-        data['_raw_frontmatter'] = yaml_text
-        return data
+            else:
+                data[key] = []  # Prepare for list items
+                
+    data['_raw_frontmatter'] = yaml_text
+    return data
 
 def find_all_strings(val) -> list:
     strings = []
