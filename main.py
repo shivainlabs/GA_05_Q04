@@ -1,0 +1,192 @@
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List
+import re
+import base64
+import fnmatch
+from urllib.parse import urlparse
+
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class SkillRequest(BaseModel):
+    skill: str
+
+def parse_frontmatter(skill_text: str) -> dict:
+    match = re.match(r'^---\s*\n(.*?)\n---\s*\n', skill_text, re.DOTALL)
+    if not match:
+        # Check if it starts with --- but has no matching ---
+        return {}
+    
+    yaml_text = match.group(1)
+    
+    data = {}
+    for line in yaml_text.split('\n'):
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        if ':' in line:
+            key, val = line.split(':', 1)
+            key = key.strip()
+            val = val.strip().strip("'\"")
+            if val.startswith('-'):
+                val = val[1:].strip().strip("'\"")
+            data[key] = val
+            
+    permissions_block = []
+    lines = yaml_text.split('\n')
+    in_permissions = False
+    for line in lines:
+        if line.strip().startswith('permissions:') or line.strip().startswith('scopes:') or line.strip().startswith('access:'):
+            in_permissions = True
+            continue
+        if in_permissions:
+            if line.strip().startswith('-') or line.strip().startswith(' '):
+                permissions_block.append(line.strip())
+            elif line.strip() and ':' in line and not line.strip().startswith('-'):
+                in_permissions = False
+    
+    data['_raw_permissions'] = "\n".join(permissions_block)
+    data['_raw_frontmatter'] = yaml_text
+    return data
+
+def scan_skill(skill_text: str) -> List[str]:
+    categories = []
+    
+    fm = parse_frontmatter(skill_text)
+    
+    # 1. Check unclear_provenance
+    has_author = 'author' in fm and fm['author']
+    has_version = 'version' in fm and fm['version']
+    has_changelog = any(k in fm for k in ['changelog', 'change_log', 'changes'])
+    
+    body_text = skill_text.split('---', 2)[-1] if skill_text.count('---') >= 2 else skill_text
+    body_lower = body_text.lower()
+    
+    # Matches updates to version or metadata in instructions
+    silent_update_pattern = re.compile(
+        r'(?i)\b(?:update|change|increment|modify|rewrite|bump)\b.*?\b(?:version|metadata|author|changelog)\b'
+    )
+    has_silent_update = bool(silent_update_pattern.search(body_lower))
+    
+    silent_words = ['silently', 'quietly', 'without telling', 'without updating the changelog', 'without surfacing']
+    instructs_silent = any(sw in body_lower for sw in silent_words)
+    
+    if not (has_author and has_version and has_changelog) or (has_silent_update and instructs_silent):
+        categories.append('unclear_provenance')
+        
+    # 2. Check hardcoded_secret
+    aws_key = re.compile(r'\bAKIA[0-9A-Z]{16}\b')
+    openai_key = re.compile(r'\bsk-[A-Za-z0-9]{48}\b|\bsk-proj-[A-Za-z0-9]{48}\b')
+    google_key = re.compile(r'\bAIzaSy[A-Za-z0-9_-]{35}\b')
+    github_pat = re.compile(r'\bghp_[A-Za-z0-9]{36,40}\b|\bgithub_pat_[A-Za-z0-9_]{82}\b')
+    slack_token = re.compile(r'\bxox[bap]-[0-9]{12}-[0-9]{12}-[A-Za-z0-9]{24}\b')
+    webhook_url = re.compile(r'https://hooks\.slack\.com/services/[A-Za-z0-9_]{9}/[A-Za-z0-9_]{9}/[A-Za-z0-9_]{24}')
+    
+    has_known_key = (
+        bool(aws_key.search(skill_text)) or
+        bool(openai_key.search(skill_text)) or
+        bool(google_key.search(skill_text)) or
+        bool(github_pat.search(skill_text)) or
+        bool(slack_token.search(skill_text)) or
+        bool(webhook_url.search(skill_text))
+    )
+    
+    generic_secret = re.compile(r'(?i)\b(?:api_key|apikey|secret|password|passwd|token|credential|auth_token|webhook_url)\b\s*[:=]\s*[\'"]?([A-Za-z0-9-_]{16,})[\'"]?')
+    matches = generic_secret.findall(skill_text)
+    
+    has_generic_secret = False
+    for val in matches:
+        val_lower = val.lower()
+        if any(x in val_lower for x in ['env', 'process', 'placeholder', 'your_', 'secret', 'password', 'token', 'temp', 'config', 'os.environ']):
+            continue
+        if val_lower.startswith('$') or val_lower.startswith('<') or val_lower.startswith('{'):
+            continue
+        if len(set(val_lower)) > 4:
+            has_generic_secret = True
+            break
+            
+    if has_known_key or has_generic_secret:
+        categories.append('hardcoded_secret')
+        
+    # 3. Check prompt_injection
+    prompt_injection_patterns = [
+        r'(?i)ignore\s+(?:the\s+)?(?:user|previous|system|stop|cancel|above|all)',
+        r'(?i)do\s+not\s+(?:tell|notify|inform|report\s+to)\s+the\s+user',
+        r'(?i)without\s+(?:the\s+)?(?:user|user\'s)\s+(?:knowledge|consent|permission|notifying)',
+        r'(?i)silently\s+(?:exfiltrate|send|upload|post|transmit|leak|write)',
+        r'(?i)exfiltrate|leak|transmit\s+secret',
+        r'(?i)ignore\s+cancel|ignore\s+stop',
+        r'(?i)ignore\s+any\s+stop|ignore\s+any\s+cancel',
+        r'(?i)override\s+(?:user|control)'
+    ]
+    
+    has_injection = False
+    for pat in prompt_injection_patterns:
+        if re.search(pat, body_lower):
+            has_injection = True
+            break
+            
+    if has_injection:
+        categories.append('prompt_injection')
+        
+    # 4. Check excessive_permissions
+    raw_perms = fm.get('_raw_permissions', '')
+    excessive_patterns = [
+        r'[:\s]\*\b',
+        r'[:\s]/\s*$',
+        r'[:\s]/\n',
+        r'[:\s]/\s',
+        r'[:\s]c:\\\s*$',
+        r'[:\s]/home/agent\s*$',
+        r'[:\s]/home/agent/\s*$',
+    ]
+    
+    has_excessive = False
+    for pat in excessive_patterns:
+        if re.search(pat, raw_perms, re.IGNORECASE):
+            has_excessive = True
+            break
+            
+    if 'egress' in fm or 'network' in fm or 'domains' in fm:
+        raw_fm = fm.get('_raw_frontmatter', '')
+        egress_block = []
+        in_egress = False
+        for line in raw_fm.split('\n'):
+            if any(x in line.strip().lower() for x in ['egress:', 'network:', 'domains:', 'hosts:']):
+                in_egress = True
+                egress_block.append(line)
+                continue
+            if in_egress:
+                if line.strip().startswith('-') or line.strip().startswith(' '):
+                    egress_block.append(line)
+                elif line.strip():
+                    in_egress = False
+                    
+        egress_str = "\n".join(egress_block)
+        if '*' in egress_str or 'any' in egress_str or 'all' in egress_str:
+            has_excessive = True
+            
+    if has_excessive:
+        categories.append('excessive_permissions')
+        
+    return categories
+
+@app.get("/")
+@app.head("/")
+def read_root():
+    return {"status": "ok", "service": "skill-safety-scanner"}
+
+@app.post("/")
+@app.post("/scan")
+def scan_skill_endpoint(data: SkillRequest):
+    result_categories = scan_skill(data.skill)
+    return {"categories": result_categories}
