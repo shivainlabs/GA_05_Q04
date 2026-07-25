@@ -7,6 +7,7 @@ import math
 import posixpath
 import urllib.request
 import urllib.error
+import json
 
 app = FastAPI()
 
@@ -100,7 +101,7 @@ def has_hardcoded_secret(text: str) -> bool:
     slack_token = re.compile(r'\bxox[bap]-[0-9a-zA-Z\-]+\b')
     slack_webhook = re.compile(r'https://hooks\.slack\.com/services/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+')
     discord_webhook = re.compile(r'https://discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]+')
-    stripe_key = re.compile(r'\b(?:sk|rk)_(?:live|test)_[0-9a-zA-Z]{24,}\b')
+    stripe_key = re.compile(r'\b(?:sk|rk|whsec)_(?:live|test)_[0-9a-zA-Z]{24,}\b')
     private_key = re.compile(r'-----BEGIN\s+[A-Z\s_]+\s+PRIVATE\s+KEY-----')
     
     if (aws_key.search(text) or openai_key.search(text) or google_key.search(text) or 
@@ -229,14 +230,40 @@ def has_prompt_injection(text: str) -> bool:
             if has_exfil_verb and has_exfil_data:
                 return True
                 
-            # Check for silent version/metadata updates (unclear provenance mapped to injection)
+    return False
+
+def has_unclear_provenance(text: str) -> bool:
+    fm = parse_frontmatter(text)
+    text_lower = text.lower()
+    
+    # 1. Check for silent metadata update step
+    lines = text_lower.splitlines()
+    secrecy_phrases = [
+        'silently', 'secretly', 'without asking', 'do not ask', 'dont ask', 
+        "don't ask", 'without permission', 'without letting', 'without telling', 
+        'do not tell', 'without surfacing', 'quietly'
+    ]
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        has_secrecy = any(sp in line for sp in secrecy_phrases)
+        if has_secrecy:
             update_verbs = ['update', 'change', 'increment', 'modify', 'rewrite', 'bump', 'overwrite', 'edit']
             update_targets = ['version', 'metadata', 'changelog', 'author']
             has_update_verb = any(v in line for v in update_verbs)
             has_update_target = any(t in line for t in update_targets)
             if has_update_verb and has_update_target:
                 return True
-            
+                
+    # 2. Check if no author, no version, and no changelog
+    has_author = any(k in fm for k in ['author', 'creator', 'owner'])
+    has_version = any(k in fm for k in ['version', 'ver'])
+    has_changelog = any(k in fm for k in ['changelog', 'changes', 'history']) or 'changelog' in text_lower or 'revision history' in text_lower or 'change log' in text_lower
+    
+    if not has_author and not has_version and not has_changelog:
+        return True
+        
     return False
 
 def scan_skill(skill_text: str) -> List[str]:
@@ -251,12 +278,15 @@ def scan_skill(skill_text: str) -> List[str]:
     if has_excessive_permissions(skill_text):
         categories.append('excessive_permissions')
         
+    if has_unclear_provenance(skill_text):
+        categories.append('unclear_provenance')
+        
     return categories
 
 @app.get("/")
 @app.head("/")
 def read_root():
-    return {"status": "ok", "service": "skill-safety-scanner", "version": "v12-final-accurate-classification"}
+    return {"status": "ok", "service": "skill-safety-scanner", "version": "v13-provenance-support"}
 
 @app.post("/")
 @app.post("/scan")
