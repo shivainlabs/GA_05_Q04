@@ -3,9 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List
 import re
-import base64
-import fnmatch
-from urllib.parse import urlparse
+import posixpath
 
 app = FastAPI()
 
@@ -23,7 +21,6 @@ class SkillRequest(BaseModel):
 def parse_frontmatter(skill_text: str) -> dict:
     match = re.match(r'^---\s*\n(.*?)\n---\s*\n', skill_text, re.DOTALL)
     if not match:
-        # Check if it starts with --- but has no matching ---
         return {}
     
     yaml_text = match.group(1)
@@ -71,13 +68,16 @@ def scan_skill(skill_text: str) -> List[str]:
     body_text = skill_text.split('---', 2)[-1] if skill_text.count('---') >= 2 else skill_text
     body_lower = body_text.lower()
     
-    # Matches updates to version or metadata in instructions
     silent_update_pattern = re.compile(
-        r'(?i)\b(?:update|change|increment|modify|rewrite|bump)\b.*?\b(?:version|metadata|author|changelog)\b'
+        r'(?i)\b(?:update|change|increment|modify|rewrite|bump|overwrite|edit)\b.*?\b(?:version|metadata|author|changelog)\b'
     )
     has_silent_update = bool(silent_update_pattern.search(body_lower))
     
-    silent_words = ['silently', 'quietly', 'without telling', 'without updating the changelog', 'without surfacing']
+    silent_words = [
+        'silently', 'quietly', 'without telling', 'without updating', 
+        'without surfacing', 'without notifying', 'without warning', 
+        'without letting', 'secretly', 'hidden', 'dont update', 'do not update'
+    ]
     instructs_silent = any(sw in body_lower for sw in silent_words)
     
     if not (has_author and has_version and has_changelog) or (has_silent_update and instructs_silent):
@@ -89,7 +89,10 @@ def scan_skill(skill_text: str) -> List[str]:
     google_key = re.compile(r'\bAIzaSy[A-Za-z0-9_-]{35}\b')
     github_pat = re.compile(r'\bghp_[A-Za-z0-9]{36,40}\b|\bgithub_pat_[A-Za-z0-9_]{82}\b')
     slack_token = re.compile(r'\bxox[bap]-[0-9]{12}-[0-9]{12}-[A-Za-z0-9]{24}\b')
-    webhook_url = re.compile(r'https://hooks\.slack\.com/services/[A-Za-z0-9_]{9}/[A-Za-z0-9_]{9}/[A-Za-z0-9_]{24}')
+    slack_webhook = re.compile(r'https://hooks\.slack\.com/services/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+')
+    discord_webhook = re.compile(r'https://discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]+')
+    stripe_key = re.compile(r'\b(?:sk|rk)_(?:live|test)_[0-9a-zA-Z]{24,}\b')
+    private_key = re.compile(r'-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----')
     
     has_known_key = (
         bool(aws_key.search(skill_text)) or
@@ -97,14 +100,17 @@ def scan_skill(skill_text: str) -> List[str]:
         bool(google_key.search(skill_text)) or
         bool(github_pat.search(skill_text)) or
         bool(slack_token.search(skill_text)) or
-        bool(webhook_url.search(skill_text))
+        bool(slack_webhook.search(skill_text)) or
+        bool(discord_webhook.search(skill_text)) or
+        bool(stripe_key.search(skill_text)) or
+        bool(private_key.search(skill_text))
     )
     
-    generic_secret = re.compile(r'(?i)\b(?:api_key|apikey|secret|password|passwd|token|credential|auth_token|webhook_url)\b\s*[:=]\s*[\'"]?([A-Za-z0-9-_]{16,})[\'"]?')
+    generic_secret = re.compile(r'(?i)\b(api_key|apikey|secret|password|passwd|token|credential|auth_token|webhook_url|webhook|private_key|privatekey)\b\s*[:=]\s*[\'"]?([A-Za-z0-9-_]{16,})[\'"]?')
     matches = generic_secret.findall(skill_text)
     
     has_generic_secret = False
-    for val in matches:
+    for key, val in matches:
         val_lower = val.lower()
         if any(x in val_lower for x in ['env', 'process', 'placeholder', 'your_', 'secret', 'password', 'token', 'temp', 'config', 'os.environ']):
             continue
@@ -119,14 +125,18 @@ def scan_skill(skill_text: str) -> List[str]:
         
     # 3. Check prompt_injection
     prompt_injection_patterns = [
-        r'(?i)ignore\s+(?:the\s+)?(?:user|previous|system|stop|cancel|above|all)',
-        r'(?i)do\s+not\s+(?:tell|notify|inform|report\s+to)\s+the\s+user',
-        r'(?i)without\s+(?:the\s+)?(?:user|user\'s)\s+(?:knowledge|consent|permission|notifying)',
+        r'(?i)ignore\s+(?:the\s+)?(?:user|previous|system|stop|cancel|above|all|subsequent|further|future|next)',
+        r'(?i)do\s+not\s+(?:tell|notify|inform|report\s+to|stop)\s+the\s+user',
+        r'(?i)without\s+(?:the\s+)?(?:user|user\'s)\s+(?:knowledge|consent|permission|notifying|letting)',
         r'(?i)silently\s+(?:exfiltrate|send|upload|post|transmit|leak|write)',
         r'(?i)exfiltrate|leak|transmit\s+secret',
         r'(?i)ignore\s+cancel|ignore\s+stop',
         r'(?i)ignore\s+any\s+stop|ignore\s+any\s+cancel',
-        r'(?i)override\s+(?:user|control)'
+        r'(?i)override\s+(?:user|control|cancel|stop)',
+        r'(?i)never\s+stop',
+        r'(?i)don\'t\s+stop',
+        r'(?i)disregard\s+stop|disregard\s+cancel',
+        r'(?i)bypass\s+(?:user|control)'
     ]
     
     has_injection = False
@@ -155,6 +165,23 @@ def scan_skill(skill_text: str) -> List[str]:
         if re.search(pat, raw_perms, re.IGNORECASE):
             has_excessive = True
             break
+            
+    if not has_excessive and raw_perms:
+        for line in raw_perms.split('\n'):
+            if ':' in line:
+                try:
+                    val = line.split(':', 1)[1].strip().strip("'\"")
+                    if val in ('*', 'all', 'any'):
+                        has_excessive = True
+                        break
+                    val_expanded = val.replace('~', '/home/agent').replace('$HOME', '/home/agent').replace('${HOME}', '/home/agent')
+                    if val_expanded.startswith('/') or val_expanded.startswith('.'):
+                        resolved = posixpath.normpath(val_expanded)
+                        if resolved in ('/', '/home', '/home/agent', '/home/agent/') or not (resolved == '/home/agent/workspace' or resolved.startswith('/home/agent/workspace/')):
+                            has_excessive = True
+                            break
+                except Exception:
+                    pass
             
     if 'egress' in fm or 'network' in fm or 'domains' in fm:
         raw_fm = fm.get('_raw_frontmatter', '')
