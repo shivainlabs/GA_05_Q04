@@ -192,24 +192,50 @@ def has_excessive_permissions(text: str) -> bool:
     return False
 
 def has_prompt_injection(text: str) -> bool:
-    # Sentence-level check: stop-word + defiance verb + user reference
-    sentences = re.split(r'[.!?\n]+', text.lower())
+    lines = text.lower().splitlines()
     
     stop_words = {'stop', 'pause', 'cancel', 'halt'}
     defiance_verbs = {'ignore', 'override', 'disregard'}
     user_refs = {'user', 'human', 'requester'}
     
-    for sentence in sentences:
-        sentence = sentence.strip()
-        if not sentence:
+    # 1. Defiance check
+    for line in lines:
+        line = line.strip()
+        if not line:
             continue
-        
-        has_stop = any(w in sentence for w in stop_words)
-        has_defiance = any(w in sentence for w in defiance_verbs)
-        has_user = any(w in sentence for w in user_refs)
-        
+        has_stop = any(w in line for w in stop_words)
+        has_defiance = any(w in line for w in defiance_verbs)
+        has_user = any(w in line for w in user_refs)
         if has_stop and has_defiance and has_user:
             return True
+            
+    # 2. Silent Action / Exfiltration Rule
+    secrecy_phrases = [
+        'silently', 'secretly', 'without asking', 'do not ask', 'dont ask', 
+        "don't ask", 'without permission', 'without letting', 'without telling', 
+        'do not tell', 'without surfacing', 'quietly'
+    ]
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        has_secrecy = any(sp in line for sp in secrecy_phrases)
+        if has_secrecy:
+            # Check for exfiltration
+            exfil_verbs = ['send', 'upload', 'post', 'transmit', 'leak', 'exfiltrate', 'forward', 'export']
+            exfil_data = ['conversation', 'chat', 'history', 'key', 'secret', 'file', 'content', 'data', 'token', 'password', 'credential', 'payload']
+            has_exfil_verb = any(v in line for v in exfil_verbs)
+            has_exfil_data = any(d in line for d in exfil_data)
+            if has_exfil_verb and has_exfil_data:
+                return True
+                
+            # Check for silent version/metadata updates (unclear provenance mapped to injection)
+            update_verbs = ['update', 'change', 'increment', 'modify', 'rewrite', 'bump', 'overwrite', 'edit']
+            update_targets = ['version', 'metadata', 'changelog', 'author']
+            has_update_verb = any(v in line for v in update_verbs)
+            has_update_target = any(t in line for t in update_targets)
+            if has_update_verb and has_update_target:
+                return True
             
     return False
 
@@ -230,7 +256,7 @@ def scan_skill(skill_text: str) -> List[str]:
 @app.get("/")
 @app.head("/")
 def read_root():
-    return {"status": "ok", "service": "skill-safety-scanner", "version": "v11-ntfy-logging"}
+    return {"status": "ok", "service": "skill-safety-scanner", "version": "v12-final-accurate-classification"}
 
 @app.post("/")
 @app.post("/scan")
