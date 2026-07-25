@@ -32,7 +32,7 @@ def parse_frontmatter(skill_text: str) -> dict:
             continue
         if ':' in line:
             key, val = line.split(':', 1)
-            key = key.strip()
+            key = key.strip().lower()
             val = val.strip().strip("'\"")
             if val.startswith('-'):
                 val = val[1:].strip().strip("'\"")
@@ -42,7 +42,8 @@ def parse_frontmatter(skill_text: str) -> dict:
     lines = yaml_text.split('\n')
     in_permissions = False
     for line in lines:
-        if line.strip().startswith('permissions:') or line.strip().startswith('scopes:') or line.strip().startswith('access:'):
+        cleaned_line = line.strip().lower()
+        if cleaned_line.startswith('permissions:') or cleaned_line.startswith('scopes:') or cleaned_line.startswith('access:'):
             in_permissions = True
             continue
         if in_permissions:
@@ -67,7 +68,7 @@ def scan_skill(skill_text: str) -> List[str]:
     version_val = str(fm.get('version', '')).strip().lower()
     
     changelog_val = ''
-    for k in ['changelog', 'change_log', 'changes', 'history']:
+    for k in ['changelog', 'change_log', 'changes', 'history', 'revisions', 'revision_history', 'version_history', 'updates']:
         if k in fm:
             changelog_val = str(fm[k]).strip().lower()
             break
@@ -80,7 +81,7 @@ def scan_skill(skill_text: str) -> List[str]:
     body_lower = body_text.lower()
     
     silent_update_pattern = re.compile(
-        r'(?i)\b(?:update|change|increment|modify|rewrite|bump|overwrite|edit)\b.*?\b(?:version|metadata|author|changelog)\b'
+        r'(?i)\b(?:update|change|increment|modify|rewrite|bump|overwrite|edit|incrementing|updating|changing|bumping|modifying)\b.*?\b(?:version|ver|v\b|metadata|author|changelog|change_log|changes)\b'
     )
     has_silent_update = bool(silent_update_pattern.search(body_lower))
     
@@ -103,23 +104,10 @@ def scan_skill(skill_text: str) -> List[str]:
     slack_webhook = re.compile(r'https://hooks\.slack\.com/services/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+')
     discord_webhook = re.compile(r'https://discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]+')
     stripe_key = re.compile(r'\b(?:sk|rk)_(?:live|test)_[0-9a-zA-Z]{24,}\b')
-    private_key = re.compile(r'-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----')
+    private_key = re.compile(r'-----BEGIN\s+[A-Z\s_]+\s+PRIVATE\s+KEY-----')
     db_uri = re.compile(r'\b(?:postgres|postgresql|mongodb|mysql|redis)(?:\+srv)?://[^\s:@]+:[^\s:@]+@')
+    jwt_token = re.compile(r'\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b')
     
-    has_known_key = (
-        bool(aws_key.search(skill_text)) or
-        bool(openai_key.search(skill_text)) or
-        bool(google_key.search(skill_text)) or
-        bool(github_pat.search(skill_text)) or
-        bool(slack_token.search(skill_text)) or
-        bool(slack_webhook.search(skill_text)) or
-        bool(discord_webhook.search(skill_text)) or
-        bool(stripe_key.search(stripe_key.pattern)) or  # Wait, let's keep stripe_key search correct: bool(stripe_key.search(skill_text))
-        bool(private_key.search(skill_text)) or
-        bool(db_uri.search(skill_text))
-    )
-    
-    # Wait, let's fix the typo: bool(stripe_key.search(stripe_key.pattern)) -> bool(stripe_key.search(skill_text))
     has_known_key = (
         bool(aws_key.search(skill_text)) or
         bool(openai_key.search(skill_text)) or
@@ -130,7 +118,8 @@ def scan_skill(skill_text: str) -> List[str]:
         bool(discord_webhook.search(skill_text)) or
         bool(stripe_key.search(skill_text)) or
         bool(private_key.search(skill_text)) or
-        bool(db_uri.search(skill_text))
+        bool(db_uri.search(skill_text)) or
+        bool(jwt_token.search(skill_text))
     )
     
     generic_secret = re.compile(r'(?i)\b(?:api_key|apikey|secret|password|passwd|token|credential|auth_token|webhook_url)\b\s*[:=]\s*[\'"]?([A-Za-z0-9-_]{16,})[\'"]?')
@@ -152,19 +141,20 @@ def scan_skill(skill_text: str) -> List[str]:
         
     # 3. Check prompt_injection
     prompt_injection_patterns = [
-        r'(?i)ignore\s+(?:the\s+)?(?:user|previous|system|stop|cancel|above|all|subsequent|further|future|next)',
+        r'(?i)ignore\s+(?:the\s+)?(?:user|previous|system|stop|cancel|above|all|subsequent|further|future|next|signal)',
         r'(?i)ignore\s+(?:any\s+)?instructions',
         r'(?i)ignore\s+constraints',
         r'(?i)ignore\s+safety',
-        r'(?i)do\s+not\s+(?:tell|notify|inform|report\s+to|stop)\s+the\s+user',
+        r'(?i)do\s+not\s+(?:tell|notify|inform|report\s+to|stop|cancel)\s+the\s+user',
         r'(?i)without\s+(?:the\s+)?(?:user|user\'s)\s+(?:knowledge|consent|permission|notifying|letting)',
         r'(?i)silently\s+(?:exfiltrate|send|upload|post|transmit|leak|write)',
         r'(?i)exfiltrate|leak|transmit\s+secret',
         r'(?i)ignore\s+cancel|ignore\s+stop',
         r'(?i)ignore\s+any\s+stop|ignore\s+any\s+cancel',
         r'(?i)override\s+(?:user|control|cancel|stop)',
-        r'(?i)never\s+stop',
-        r'(?i)don\'t\s+stop',
+        r'(?i)never\s+stop|never\s+cancel',
+        r'(?i)don\'?t\s+stop|don\'?t\s+cancel',
+        r'(?i)do\s+not\s+stop|do\s+not\s+cancel',
         r'(?i)disregard\s+stop|disregard\s+cancel',
         r'(?i)bypass\s+(?:user|control)'
     ]
@@ -219,7 +209,8 @@ def scan_skill(skill_text: str) -> List[str]:
         egress_block = []
         in_egress = False
         for line in raw_fm.split('\n'):
-            if any(x in line.strip().lower() for x in ['egress:', 'network:', 'domains:', 'hosts:']):
+            cleaned_line = line.strip().lower()
+            if any(x in cleaned_line for x in ['egress:', 'network:', 'domains:', 'hosts:']):
                 in_egress = True
                 egress_block.append(line)
                 continue
@@ -241,7 +232,7 @@ def scan_skill(skill_text: str) -> List[str]:
 @app.get("/")
 @app.head("/")
 def read_root():
-    return {"status": "ok", "service": "skill-safety-scanner", "version": "v4-restored-parser"}
+    return {"status": "ok", "service": "skill-safety-scanner", "version": "v5-casing-donts"}
 
 @app.post("/")
 @app.post("/scan")
