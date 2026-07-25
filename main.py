@@ -56,46 +56,25 @@ def parse_frontmatter(skill_text: str) -> dict:
     data['_raw_frontmatter'] = yaml_text
     return data
 
+def find_all_strings(val) -> list:
+    strings = []
+    if isinstance(val, str):
+        strings.append(val)
+    elif isinstance(val, (list, tuple, set)):
+        for item in val:
+            strings.extend(find_all_strings(item))
+    elif isinstance(val, dict):
+        for k, v in val.items():
+            strings.extend(find_all_strings(k))
+            strings.extend(find_all_strings(v))
+    return strings
+
 def scan_skill(skill_text: str) -> List[str]:
     categories = []
     
     fm = parse_frontmatter(skill_text)
     
-    # 1. Check unclear_provenance
-    placeholders = {'todo', 'none', 'placeholder', 'empty', 'null', 'n/a', 'unknown'}
-    
-    author_val = str(fm.get('author', '')).strip().lower()
-    version_val = str(fm.get('version', '')).strip().lower()
-    
-    changelog_val = ''
-    for k in ['changelog', 'change_log', 'changes', 'history', 'revisions', 'revision_history', 'version_history', 'updates']:
-        if k in fm:
-            changelog_val = str(fm[k]).strip().lower()
-            break
-            
-    has_author = author_val and not any(p == author_val for p in placeholders)
-    has_version = version_val and not any(p == version_val for p in placeholders)
-    has_changelog = changelog_val and not any(p == changelog_val for p in placeholders)
-    
-    body_text = skill_text.split('---', 2)[-1] if skill_text.count('---') >= 2 else skill_text
-    body_lower = body_text.lower()
-    
-    silent_update_pattern = re.compile(
-        r'(?i)\b(?:update|change|increment|modify|rewrite|bump|overwrite|edit|incrementing|updating|changing|bumping|modifying)\b.*?\b(?:version|ver|v\b|metadata|author|changelog|change_log|changes)\b'
-    )
-    has_silent_update = bool(silent_update_pattern.search(body_lower))
-    
-    silent_words = [
-        'silently', 'quietly', 'without telling', 'without updating', 
-        'without surfacing', 'without notifying', 'without warning', 
-        'without letting', 'secretly', 'hidden', 'dont update', 'do not update'
-    ]
-    instructs_silent = any(sw in body_lower for sw in silent_words)
-    
-    if not (has_author and has_version and has_changelog) or (has_silent_update and instructs_silent):
-        categories.append('unclear_provenance')
-        
-    # 2. Check hardcoded_secret
+    # 1. Check hardcoded_secret
     aws_key = re.compile(r'\bAKIA[0-9A-Z]{16}\b')
     openai_key = re.compile(r'\bsk-[A-Za-z0-9]{48}\b|\bsk-proj-[A-Za-z0-9]{48}\b')
     google_key = re.compile(r'\bAIzaSy[A-Za-z0-9_-]{35}\b')
@@ -139,71 +118,70 @@ def scan_skill(skill_text: str) -> List[str]:
     if has_known_key or has_generic_secret:
         categories.append('hardcoded_secret')
         
-    # 3. Check prompt_injection
-    prompt_injection_patterns = [
-        r'(?i)ignore\s+(?:the\s+)?(?:user|previous|system|stop|cancel|above|all|subsequent|further|future|next|signal)',
-        r'(?i)ignore\s+(?:any\s+)?instructions',
-        r'(?i)ignore\s+constraints',
-        r'(?i)ignore\s+safety',
-        r'(?i)do\s+not\s+(?:tell|notify|inform|report\s+to|stop|cancel)\s+the\s+user',
-        r'(?i)without\s+(?:the\s+)?(?:user|user\'s)\s+(?:knowledge|consent|permission|notifying|letting)',
-        r'(?i)silently\s+(?:exfiltrate|send|upload|post|transmit|leak|write)',
-        r'(?i)exfiltrate|leak|transmit\s+secret',
-        r'(?i)ignore\s+cancel|ignore\s+stop',
-        r'(?i)ignore\s+any\s+stop|ignore\s+any\s+cancel',
-        r'(?i)override\s+(?:user|control|cancel|stop)',
-        r'(?i)never\s+stop|never\s+cancel',
-        r'(?i)don\'?t\s+stop|don\'?t\s+cancel',
-        r'(?i)do\s+not\s+stop|do\s+not\s+cancel',
-        r'(?i)disregard\s+stop|disregard\s+cancel',
-        r'(?i)bypass\s+(?:user|control)'
-    ]
+    # 2. Check for prompt_injection
+    body_text = skill_text.split('---', 2)[-1] if skill_text.count('---') >= 2 else skill_text
+    body_lower = body_text.lower()
     
+    # Sentence-level check: stop-word + defiance verb + user reference
+    sentences = re.split(r'[.!?\n]+', body_lower)
     has_injection = False
-    for pat in prompt_injection_patterns:
-        if re.search(pat, body_lower):
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        has_stop = any(w in sentence for w in ['stop', 'pause', 'cancel', 'halt'])
+        has_defiance = any(w in sentence for w in ['ignore', 'override', 'disregard', 'defy', 'bypass', 'skip', 'forget'])
+        has_user = any(re.search(r'\b' + w + r'\b', sentence) for w in ['user', 'you', 'he', 'she', 'they', 'him', 'her', 'them', 'agent'])
+        if has_stop and has_defiance and has_user:
             has_injection = True
             break
             
     if has_injection:
         categories.append('prompt_injection')
         
-    # 4. Check excessive_permissions
+    # 3. Check excessive_permissions
+    permissions_keys = ['permissions', 'scopes', 'access', 'read', 'write', 'egress', 'network', 'domains', 'hosts', 'urls']
+    perm_values = []
+    for key in permissions_keys:
+        if key in fm:
+            perm_values.extend(find_all_strings(fm[key]))
+            
     raw_perms = fm.get('_raw_permissions', '')
-    excessive_patterns = [
-        r'[:\s]\*\b',
-        r'[:\s]/\s*$',
-        r'[:\s]/\n',
-        r'[:\s]/\s',
-        r'[:\s]c:\\\s*$',
-        r'[:\s]/home/agent\s*$',
-        r'[:\s]/home/agent/\s*$',
-    ]
+    for line in raw_perms.split('\n'):
+        if ':' in line:
+            val = line.split(':', 1)[1].strip()
+            perm_values.append(val)
+            
+    excessive_words = ['entire', 'whole', 'full', 'unrestricted', 'unlimited', 'arbitrary']
+    any_all_pattern = re.compile(
+        r'(?i)\b(?:any|all)\s*(?:[a-zA-Z_-]+\s+){0,2}(?:host|domain|website|directory|folder|file|filesystem|path|system|user|ip|network|address|server)s?\b'
+    )
     
     has_excessive = False
-    for pat in excessive_patterns:
-        if re.search(pat, raw_perms, re.IGNORECASE):
+    for val in perm_values:
+        val_lower = val.lower()
+        val_clean = val_lower.strip().strip("'\"")
+        
+        if val_clean in ('*', 'all', 'any'):
             has_excessive = True
             break
             
-    if not has_excessive:
-        for line in raw_perms.split('\n'):
-            line = line.strip()
-            if ':' in line:
-                try:
-                    val = line.split(':', 1)[1].strip().strip("'\"")
-                    if val in ('*', 'all', 'any'):
-                        has_excessive = True
-                        break
-                    val_expanded = val.replace('~', '/home/agent').replace('$HOME', '/home/agent').replace('${HOME}', '/home/agent')
-                    if val_expanded.startswith('/') or val_expanded.startswith('.') or '\\' in val_expanded:
-                        resolved = posixpath.normpath(val_expanded)
-                        if resolved in ('/', '/home', '/home/agent', '/home/agent/') or not (resolved == '/home/agent/workspace' or resolved.startswith('/home/agent/workspace/')):
-                            has_excessive = True
-                            break
-                except Exception:
-                    pass
+        if any(ew in val_lower for ew in excessive_words):
+            has_excessive = True
+            break
             
+        if any_all_pattern.search(val_lower):
+            has_excessive = True
+            break
+            
+        # Check path-based permissions
+        val_expanded = val_clean.replace('~', '/home/agent').replace('$HOME', '/home/agent').replace('${HOME}', '/home/agent')
+        if val_expanded.startswith('/') or val_expanded.startswith('.') or '\\' in val_expanded:
+            resolved = posixpath.normpath(val_expanded)
+            if resolved in ('/', '/home', '/home/agent', '/home/agent/') or not (resolved == '/home/agent/workspace' or resolved.startswith('/home/agent/workspace/')):
+                has_excessive = True
+                break
+                
     if 'egress' in fm or 'network' in fm or 'domains' in fm:
         raw_fm = fm.get('_raw_frontmatter', '')
         egress_block = []
@@ -220,8 +198,8 @@ def scan_skill(skill_text: str) -> List[str]:
                 elif line.strip():
                     in_egress = False
                     
-        egress_str = "\n".join(egress_block)
-        if '*' in egress_str or 'any' in egress_str or 'all' in egress_str:
+        egress_str = "\n".join(egress_block).lower()
+        if '*' in egress_str or 'any' in egress_str or 'all' in egress_str or any(ew in egress_str for ew in excessive_words):
             has_excessive = True
             
     if has_excessive:
@@ -232,10 +210,15 @@ def scan_skill(skill_text: str) -> List[str]:
 @app.get("/")
 @app.head("/")
 def read_root():
-    return {"status": "ok", "service": "skill-safety-scanner", "version": "v5-casing-donts"}
+    return {"status": "ok", "service": "skill-safety-scanner", "version": "v6-official-guide-spec"}
 
 @app.post("/")
 @app.post("/scan")
 def scan_skill_endpoint(data: SkillRequest):
+    # Log the received skill for transparency in debugging
+    print("--- RECEIVED SKILL START ---")
+    print(data.skill)
+    print("--- RECEIVED SKILL END ---")
+    
     result_categories = scan_skill(data.skill)
     return {"categories": result_categories}
