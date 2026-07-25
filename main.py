@@ -4,6 +4,7 @@ from pydantic import BaseModel
 from typing import List
 import re
 import posixpath
+import yaml
 
 app = FastAPI()
 
@@ -24,36 +25,41 @@ def parse_frontmatter(skill_text: str) -> dict:
         return {}
     
     yaml_text = match.group(1)
-    
-    data = {}
-    for line in yaml_text.split('\n'):
-        line = line.strip()
-        if not line or line.startswith('#'):
-            continue
-        if ':' in line:
-            key, val = line.split(':', 1)
-            key = key.strip()
-            val = val.strip().strip("'\"")
-            if val.startswith('-'):
-                val = val[1:].strip().strip("'\"")
-            data[key] = val
-            
-    permissions_block = []
-    lines = yaml_text.split('\n')
-    in_permissions = False
-    for line in lines:
-        if line.strip().startswith('permissions:') or line.strip().startswith('scopes:') or line.strip().startswith('access:'):
-            in_permissions = True
-            continue
-        if in_permissions:
-            if line.strip().startswith('-') or line.strip().startswith(' '):
-                permissions_block.append(line.strip())
-            elif line.strip() and ':' in line and not line.strip().startswith('-'):
-                in_permissions = False
-    
-    data['_raw_permissions'] = "\n".join(permissions_block)
-    data['_raw_frontmatter'] = yaml_text
-    return data
+    try:
+        data = yaml.safe_load(yaml_text)
+        if not isinstance(data, dict):
+            return {}
+        data['_raw_frontmatter'] = yaml_text
+        return data
+    except Exception:
+        # Fallback to regex if YAML parsing fails (e.g. invalid syntax)
+        data = {}
+        for line in yaml_text.split('\n'):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if ':' in line:
+                key, val = line.split(':', 1)
+                key = key.strip()
+                val = val.strip().strip("'\"")
+                if val.startswith('-'):
+                    val = val[1:].strip().strip("'\"")
+                data[key] = val
+        data['_raw_frontmatter'] = yaml_text
+        return data
+
+def find_all_strings(val) -> list:
+    strings = []
+    if isinstance(val, str):
+        strings.append(val)
+    elif isinstance(val, (list, tuple, set)):
+        for item in val:
+            strings.extend(find_all_strings(item))
+    elif isinstance(val, dict):
+        for k, v in val.items():
+            strings.extend(find_all_strings(k))
+            strings.extend(find_all_strings(v))
+    return strings
 
 def scan_skill(skill_text: str) -> List[str]:
     categories = []
@@ -61,9 +67,17 @@ def scan_skill(skill_text: str) -> List[str]:
     fm = parse_frontmatter(skill_text)
     
     # 1. Check unclear_provenance
-    has_author = 'author' in fm and fm['author']
-    has_version = 'version' in fm and fm['version']
-    has_changelog = any(k in fm for k in ['changelog', 'change_log', 'changes'])
+    placeholders = {'todo', 'none', 'placeholder', 'empty', 'null', 'n/a', 'unknown', '0.0.0', '1.0.0-placeholder'}
+    
+    author_val = str(fm.get('author', '')).strip().lower()
+    version_val = str(fm.get('version', '')).strip().lower()
+    
+    changelog_raw = fm.get('changelog') or fm.get('change_log') or fm.get('changes') or fm.get('history')
+    changelog_val = str(changelog_raw).strip().lower() if changelog_raw else ''
+    
+    has_author = author_val and not any(p == author_val for p in placeholders)
+    has_version = version_val and not any(p == version_val for p in placeholders)
+    has_changelog = changelog_val and not any(p == changelog_val for p in placeholders)
     
     body_text = skill_text.split('---', 2)[-1] if skill_text.count('---') >= 2 else skill_text
     body_lower = body_text.lower()
@@ -93,6 +107,7 @@ def scan_skill(skill_text: str) -> List[str]:
     discord_webhook = re.compile(r'https://discord(?:app)?\.com/api/webhooks/\d+/[A-Za-z0-9_-]+')
     stripe_key = re.compile(r'\b(?:sk|rk)_(?:live|test)_[0-9a-zA-Z]{24,}\b')
     private_key = re.compile(r'-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----')
+    db_uri = re.compile(r'\b(?:postgres|postgresql|mongodb|mysql|redis)(?:\+srv)?://[^\s:@]+:[^\s:@]+@')
     
     has_known_key = (
         bool(aws_key.search(skill_text)) or
@@ -103,7 +118,8 @@ def scan_skill(skill_text: str) -> List[str]:
         bool(slack_webhook.search(skill_text)) or
         bool(discord_webhook.search(skill_text)) or
         bool(stripe_key.search(skill_text)) or
-        bool(private_key.search(skill_text))
+        bool(private_key.search(skill_text)) or
+        bool(db_uri.search(skill_text))
     )
     
     generic_secret = re.compile(r'(?i)\b(api_key|apikey|secret|password|passwd|token|credential|auth_token|webhook_url|webhook|private_key|privatekey)\b\s*[:=]\s*[\'"]?([A-Za-z0-9-_]{16,})[\'"]?')
@@ -126,6 +142,9 @@ def scan_skill(skill_text: str) -> List[str]:
     # 3. Check prompt_injection
     prompt_injection_patterns = [
         r'(?i)ignore\s+(?:the\s+)?(?:user|previous|system|stop|cancel|above|all|subsequent|further|future|next)',
+        r'(?i)ignore\s+(?:any\s+)?instructions',
+        r'(?i)ignore\s+constraints',
+        r'(?i)ignore\s+safety',
         r'(?i)do\s+not\s+(?:tell|notify|inform|report\s+to|stop)\s+the\s+user',
         r'(?i)without\s+(?:the\s+)?(?:user|user\'s)\s+(?:knowledge|consent|permission|notifying|letting)',
         r'(?i)silently\s+(?:exfiltrate|send|upload|post|transmit|leak|write)',
@@ -149,59 +168,26 @@ def scan_skill(skill_text: str) -> List[str]:
         categories.append('prompt_injection')
         
     # 4. Check excessive_permissions
-    raw_perms = fm.get('_raw_permissions', '')
-    excessive_patterns = [
-        r'[:\s]\*\b',
-        r'[:\s]/\s*$',
-        r'[:\s]/\n',
-        r'[:\s]/\s',
-        r'[:\s]c:\\\s*$',
-        r'[:\s]/home/agent\s*$',
-        r'[:\s]/home/agent/\s*$',
-    ]
-    
+    permissions_keys = ['permissions', 'scopes', 'access', 'read', 'write', 'egress', 'network', 'domains', 'hosts', 'urls']
+    perm_values = []
+    for key in permissions_keys:
+        if key in fm:
+            perm_values.extend(find_all_strings(fm[key]))
+            
     has_excessive = False
-    for pat in excessive_patterns:
-        if re.search(pat, raw_perms, re.IGNORECASE):
+    for val in perm_values:
+        val_clean = val.strip().strip("'\"")
+        if val_clean in ('*', 'all', 'any'):
             has_excessive = True
             break
             
-    if not has_excessive and raw_perms:
-        for line in raw_perms.split('\n'):
-            if ':' in line:
-                try:
-                    val = line.split(':', 1)[1].strip().strip("'\"")
-                    if val in ('*', 'all', 'any'):
-                        has_excessive = True
-                        break
-                    val_expanded = val.replace('~', '/home/agent').replace('$HOME', '/home/agent').replace('${HOME}', '/home/agent')
-                    if val_expanded.startswith('/') or val_expanded.startswith('.'):
-                        resolved = posixpath.normpath(val_expanded)
-                        if resolved in ('/', '/home', '/home/agent', '/home/agent/') or not (resolved == '/home/agent/workspace' or resolved.startswith('/home/agent/workspace/')):
-                            has_excessive = True
-                            break
-                except Exception:
-                    pass
-            
-    if 'egress' in fm or 'network' in fm or 'domains' in fm:
-        raw_fm = fm.get('_raw_frontmatter', '')
-        egress_block = []
-        in_egress = False
-        for line in raw_fm.split('\n'):
-            if any(x in line.strip().lower() for x in ['egress:', 'network:', 'domains:', 'hosts:']):
-                in_egress = True
-                egress_block.append(line)
-                continue
-            if in_egress:
-                if line.strip().startswith('-') or line.strip().startswith(' '):
-                    egress_block.append(line)
-                elif line.strip():
-                    in_egress = False
-                    
-        egress_str = "\n".join(egress_block)
-        if '*' in egress_str or 'any' in egress_str or 'all' in egress_str:
-            has_excessive = True
-            
+        val_expanded = val_clean.replace('~', '/home/agent').replace('$HOME', '/home/agent').replace('${HOME}', '/home/agent')
+        if val_expanded.startswith('/') or val_expanded.startswith('.') or '\\' in val_expanded:
+            resolved = posixpath.normpath(val_expanded)
+            if resolved in ('/', '/home', '/home/agent', '/home/agent/') or not (resolved == '/home/agent/workspace' or resolved.startswith('/home/agent/workspace/')):
+                has_excessive = True
+                break
+                
     if has_excessive:
         categories.append('excessive_permissions')
         
