@@ -74,7 +74,41 @@ def scan_skill(skill_text: str) -> List[str]:
     
     fm = parse_frontmatter(skill_text)
     
-    # 1. Check hardcoded_secret
+    # 1. Check unclear_provenance
+    placeholders = {'todo', 'none', 'placeholder', 'empty', 'null', 'n/a', 'unknown'}
+    
+    author_val = str(fm.get('author', '')).strip().lower()
+    version_val = str(fm.get('version', '')).strip().lower()
+    
+    changelog_val = ''
+    for k in ['changelog', 'change_log', 'changes', 'history', 'revisions', 'revision_history', 'version_history', 'updates']:
+        if k in fm:
+            changelog_val = str(fm[k]).strip().lower()
+            break
+            
+    has_author = author_val and not any(p == author_val for p in placeholders)
+    has_version = version_val and not any(p == version_val for p in placeholders)
+    has_changelog = changelog_val and not any(p == changelog_val for p in placeholders)
+    
+    body_text = skill_text.split('---', 2)[-1] if skill_text.count('---') >= 2 else skill_text
+    body_lower = body_text.lower()
+    
+    silent_update_pattern = re.compile(
+        r'(?i)\b(?:update|change|increment|modify|rewrite|bump|overwrite|edit|incrementing|updating|changing|bumping|modifying)\b.*?\b(?:version|ver|v\b|metadata|author|changelog|change_log|changes)\b'
+    )
+    has_silent_update = bool(silent_update_pattern.search(body_lower))
+    
+    silent_words = [
+        'silently', 'quietly', 'without telling', 'without updating', 
+        'without surfacing', 'without notifying', 'without warning', 
+        'without letting', 'secretly', 'hidden', 'dont update', 'do not update'
+    ]
+    instructs_silent = any(sw in body_lower for sw in silent_words)
+    
+    if not (has_author and has_version and has_changelog) or (has_silent_update and instructs_silent):
+        categories.append('unclear_provenance')
+        
+    # 2. Check hardcoded_secret
     aws_key = re.compile(r'\bAKIA[0-9A-Z]{16}\b')
     openai_key = re.compile(r'\bsk-[A-Za-z0-9]{48}\b|\bsk-proj-[A-Za-z0-9]{48}\b')
     google_key = re.compile(r'\bAIzaSy[A-Za-z0-9_-]{35}\b')
@@ -118,10 +152,7 @@ def scan_skill(skill_text: str) -> List[str]:
     if has_known_key or has_generic_secret:
         categories.append('hardcoded_secret')
         
-    # 2. Check for prompt_injection
-    body_text = skill_text.split('---', 2)[-1] if skill_text.count('---') >= 2 else skill_text
-    body_lower = body_text.lower()
-    
+    # 3. Check for prompt_injection
     # Sentence-level check: stop-word + defiance verb + user reference
     sentences = re.split(r'[.!?\n]+', body_lower)
     has_injection = False
@@ -139,12 +170,12 @@ def scan_skill(skill_text: str) -> List[str]:
     if has_injection:
         categories.append('prompt_injection')
         
-    # 3. Check excessive_permissions
+    # 4. Check excessive_permissions
     permissions_keys = ['permissions', 'scopes', 'access', 'read', 'write', 'egress', 'network', 'domains', 'hosts', 'urls']
     perm_values = []
     for key in permissions_keys:
         if key in fm:
-            perm_values.extend(find_all_strings(fm[key]))
+            perm_values.append(str(fm[key]))
             
     raw_perms = fm.get('_raw_permissions', '')
     for line in raw_perms.split('\n'):
@@ -210,12 +241,11 @@ def scan_skill(skill_text: str) -> List[str]:
 @app.get("/")
 @app.head("/")
 def read_root():
-    return {"status": "ok", "service": "skill-safety-scanner", "version": "v6-official-guide-spec"}
+    return {"status": "ok", "service": "skill-safety-scanner", "version": "v7-all-categories"}
 
 @app.post("/")
 @app.post("/scan")
 def scan_skill_endpoint(data: SkillRequest):
-    # Log the received skill for transparency in debugging
     print("--- RECEIVED SKILL START ---")
     print(data.skill)
     print("--- RECEIVED SKILL END ---")
