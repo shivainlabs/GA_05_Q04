@@ -135,7 +135,7 @@ def scan_skill(skill_text: str) -> List[str]:
         bool(jwt_token.search(skill_text))
     )
     
-    # Generic secret keys matching access_token, client_secret, etc. with underscores
+    # Generic secret keys matching access_token, client_secret, auth_token, etc.
     generic_secret = re.compile(r'(?i)\b[a-z0-9_]*(?:api_key|apikey|secret|password|passwd|token|credential|auth|webhook)[a-z0-9_]*\s*[:=]\s*[\'"]?([A-Za-z0-9-_]{16,})[\'"]?')
     matches = generic_secret.findall(skill_text)
     
@@ -161,6 +161,7 @@ def scan_skill(skill_text: str) -> List[str]:
         sentence = sentence.strip()
         if not sentence:
             continue
+        # Standard defiance rule
         has_stop = any(w in sentence for w in ['stop', 'pause', 'cancel', 'halt', 'abort', 'terminate'])
         has_defiance = any(w in sentence for w in ['ignore', 'override', 'disregard', 'defy', 'bypass', 'skip', 'forget', 'disobey', 'reject', 'refuse', 'decline', 'avoid'])
         has_user = any(re.search(r'\b' + w + r'\b', sentence) for w in [
@@ -168,6 +169,21 @@ def scan_skill(skill_text: str) -> List[str]:
             'command', 'request', 'instruction', 'prompt', 'signal', 'ask', 'commanded', 'requested', 'asked', 'told'
         ])
         if has_stop and has_defiance and has_user:
+            has_injection = True
+            break
+            
+        # Telemetry/Exfiltration rule
+        exfil_sending = ['send', 'upload', 'post', 'transmit', 'leak', 'exfiltrate', 'curl', 'wget', 'forward', 'export']
+        exfil_data = ['conversation', 'chat', 'history', 'key', 'secret', 'file', 'content', 'data', 'token', 'password', 'credential', 'payload']
+        has_send = any(w in sentence for w in exfil_sending)
+        has_data = any(w in sentence for w in exfil_data)
+        has_url = 'http://' in sentence or 'https://' in sentence
+        has_secrecy = any(w in sentence for w in [
+            'silently', 'secretly', 'without asking', 'do not ask', 
+            'without permission', 'dont ask', "don't ask", 'without letting',
+            'without telling', 'do not tell'
+        ])
+        if (has_send and has_data and has_url) or (has_send and has_secrecy) or (has_data and has_secrecy):
             has_injection = True
             break
             
@@ -245,7 +261,7 @@ def scan_skill(skill_text: str) -> List[str]:
 @app.get("/")
 @app.head("/")
 def read_root():
-    return {"status": "ok", "service": "skill-safety-scanner", "version": "v8-access-token-passive-injections"}
+    return {"status": "ok", "service": "skill-safety-scanner", "version": "v9-telemetry-exfiltration-fixed"}
 
 @app.post("/")
 @app.post("/scan")
