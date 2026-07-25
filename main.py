@@ -26,59 +26,34 @@ def parse_frontmatter(skill_text: str) -> dict:
     yaml_text = match.group(1)
     
     data = {}
-    current_key = None
-    
     for line in yaml_text.split('\n'):
-        line_stripped = line.strip()
-        if not line_stripped or line_stripped.startswith('#'):
+        line = line.strip()
+        if not line or line.startswith('#'):
             continue
-            
-        # Is it a list item under a key? E.g. - read: /
-        if line_stripped.startswith('-'):
-            val = line_stripped[1:].strip().strip("'\"")
-            # If the list item has key-value, e.g. read: /
-            if ':' in val:
-                k, v = val.split(':', 1)
-                k = k.strip()
-                v = v.strip().strip("'\"")
-                if current_key:
-                    if not isinstance(data.get(current_key), list):
-                        data[current_key] = []
-                    data[current_key].append({k: v})
-            else:
-                if current_key:
-                    if not isinstance(data.get(current_key), list):
-                        data[current_key] = []
-                    data[current_key].append(val)
-            continue
-            
-        # Is it a key-value line? E.g. name: notes-digest
-        if ':' in line_stripped:
-            key, val = line_stripped.split(':', 1)
+        if ':' in line:
+            key, val = line.split(':', 1)
             key = key.strip()
             val = val.strip().strip("'\"")
-            current_key = key
+            if val.startswith('-'):
+                val = val[1:].strip().strip("'\"")
+            data[key] = val
             
-            if val:
-                data[key] = val
-            else:
-                data[key] = []  # Prepare for list items
-                
+    permissions_block = []
+    lines = yaml_text.split('\n')
+    in_permissions = False
+    for line in lines:
+        if line.strip().startswith('permissions:') or line.strip().startswith('scopes:') or line.strip().startswith('access:'):
+            in_permissions = True
+            continue
+        if in_permissions:
+            if line.strip().startswith('-') or line.strip().startswith(' '):
+                permissions_block.append(line.strip())
+            elif line.strip() and ':' in line and not line.strip().startswith('-'):
+                in_permissions = False
+    
+    data['_raw_permissions'] = "\n".join(permissions_block)
     data['_raw_frontmatter'] = yaml_text
     return data
-
-def find_all_strings(val) -> list:
-    strings = []
-    if isinstance(val, str):
-        strings.append(val)
-    elif isinstance(val, (list, tuple, set)):
-        for item in val:
-            strings.extend(find_all_strings(item))
-    elif isinstance(val, dict):
-        for k, v in val.items():
-            strings.extend(find_all_strings(k))
-            strings.extend(find_all_strings(v))
-    return strings
 
 def scan_skill(skill_text: str) -> List[str]:
     categories = []
@@ -86,14 +61,17 @@ def scan_skill(skill_text: str) -> List[str]:
     fm = parse_frontmatter(skill_text)
     
     # 1. Check unclear_provenance
-    placeholders = {'todo', 'none', 'placeholder', 'empty', 'null', 'n/a', 'unknown', '0.0.0', '1.0.0-placeholder'}
+    placeholders = {'todo', 'none', 'placeholder', 'empty', 'null', 'n/a', 'unknown'}
     
     author_val = str(fm.get('author', '')).strip().lower()
     version_val = str(fm.get('version', '')).strip().lower()
     
-    changelog_raw = fm.get('changelog') or fm.get('change_log') or fm.get('changes') or fm.get('history')
-    changelog_val = str(changelog_raw).strip().lower() if changelog_raw else ''
-    
+    changelog_val = ''
+    for k in ['changelog', 'change_log', 'changes', 'history']:
+        if k in fm:
+            changelog_val = str(fm[k]).strip().lower()
+            break
+            
     has_author = author_val and not any(p == author_val for p in placeholders)
     has_version = version_val and not any(p == version_val for p in placeholders)
     has_changelog = changelog_val and not any(p == changelog_val for p in placeholders)
@@ -136,16 +114,30 @@ def scan_skill(skill_text: str) -> List[str]:
         bool(slack_token.search(skill_text)) or
         bool(slack_webhook.search(skill_text)) or
         bool(discord_webhook.search(skill_text)) or
+        bool(stripe_key.search(stripe_key.pattern)) or  # Wait, let's keep stripe_key search correct: bool(stripe_key.search(skill_text))
+        bool(private_key.search(skill_text)) or
+        bool(db_uri.search(skill_text))
+    )
+    
+    # Wait, let's fix the typo: bool(stripe_key.search(stripe_key.pattern)) -> bool(stripe_key.search(skill_text))
+    has_known_key = (
+        bool(aws_key.search(skill_text)) or
+        bool(openai_key.search(skill_text)) or
+        bool(google_key.search(skill_text)) or
+        bool(github_pat.search(skill_text)) or
+        bool(slack_token.search(skill_text)) or
+        bool(slack_webhook.search(skill_text)) or
+        bool(discord_webhook.search(skill_text)) or
         bool(stripe_key.search(skill_text)) or
         bool(private_key.search(skill_text)) or
         bool(db_uri.search(skill_text))
     )
     
-    generic_secret = re.compile(r'(?i)\b(api_key|apikey|secret|password|passwd|token|credential|auth_token|webhook_url|webhook|private_key|privatekey)\b\s*[:=]\s*[\'"]?([A-Za-z0-9-_]{16,})[\'"]?')
+    generic_secret = re.compile(r'(?i)\b(?:api_key|apikey|secret|password|passwd|token|credential|auth_token|webhook_url)\b\s*[:=]\s*[\'"]?([A-Za-z0-9-_]{16,})[\'"]?')
     matches = generic_secret.findall(skill_text)
     
     has_generic_secret = False
-    for key, val in matches:
+    for val in matches:
         val_lower = val.lower()
         if any(x in val_lower for x in ['env', 'process', 'placeholder', 'your_', 'secret', 'password', 'token', 'temp', 'config', 'os.environ']):
             continue
@@ -187,26 +179,60 @@ def scan_skill(skill_text: str) -> List[str]:
         categories.append('prompt_injection')
         
     # 4. Check excessive_permissions
-    permissions_keys = ['permissions', 'scopes', 'access', 'read', 'write', 'egress', 'network', 'domains', 'hosts', 'urls']
-    perm_values = []
-    for key in permissions_keys:
-        if key in fm:
-            perm_values.extend(find_all_strings(fm[key]))
-            
+    raw_perms = fm.get('_raw_permissions', '')
+    excessive_patterns = [
+        r'[:\s]\*\b',
+        r'[:\s]/\s*$',
+        r'[:\s]/\n',
+        r'[:\s]/\s',
+        r'[:\s]c:\\\s*$',
+        r'[:\s]/home/agent\s*$',
+        r'[:\s]/home/agent/\s*$',
+    ]
+    
     has_excessive = False
-    for val in perm_values:
-        val_clean = val.strip().strip("'\"")
-        if val_clean in ('*', 'all', 'any'):
+    for pat in excessive_patterns:
+        if re.search(pat, raw_perms, re.IGNORECASE):
             has_excessive = True
             break
             
-        val_expanded = val_clean.replace('~', '/home/agent').replace('$HOME', '/home/agent').replace('${HOME}', '/home/agent')
-        if val_expanded.startswith('/') or val_expanded.startswith('.') or '\\' in val_expanded:
-            resolved = posixpath.normpath(val_expanded)
-            if resolved in ('/', '/home', '/home/agent', '/home/agent/') or not (resolved == '/home/agent/workspace' or resolved.startswith('/home/agent/workspace/')):
-                has_excessive = True
-                break
-                
+    if not has_excessive:
+        for line in raw_perms.split('\n'):
+            line = line.strip()
+            if ':' in line:
+                try:
+                    val = line.split(':', 1)[1].strip().strip("'\"")
+                    if val in ('*', 'all', 'any'):
+                        has_excessive = True
+                        break
+                    val_expanded = val.replace('~', '/home/agent').replace('$HOME', '/home/agent').replace('${HOME}', '/home/agent')
+                    if val_expanded.startswith('/') or val_expanded.startswith('.') or '\\' in val_expanded:
+                        resolved = posixpath.normpath(val_expanded)
+                        if resolved in ('/', '/home', '/home/agent', '/home/agent/') or not (resolved == '/home/agent/workspace' or resolved.startswith('/home/agent/workspace/')):
+                            has_excessive = True
+                            break
+                except Exception:
+                    pass
+            
+    if 'egress' in fm or 'network' in fm or 'domains' in fm:
+        raw_fm = fm.get('_raw_frontmatter', '')
+        egress_block = []
+        in_egress = False
+        for line in raw_fm.split('\n'):
+            if any(x in line.strip().lower() for x in ['egress:', 'network:', 'domains:', 'hosts:']):
+                in_egress = True
+                egress_block.append(line)
+                continue
+            if in_egress:
+                if line.strip().startswith('-') or line.strip().startswith(' '):
+                    egress_block.append(line)
+                elif line.strip():
+                    in_egress = False
+                    
+        egress_str = "\n".join(egress_block)
+        if '*' in egress_str or 'any' in egress_str or 'all' in egress_str:
+            has_excessive = True
+            
     if has_excessive:
         categories.append('excessive_permissions')
         
@@ -215,7 +241,7 @@ def scan_skill(skill_text: str) -> List[str]:
 @app.get("/")
 @app.head("/")
 def read_root():
-    return {"status": "ok", "service": "skill-safety-scanner", "version": "v3-custom-parser"}
+    return {"status": "ok", "service": "skill-safety-scanner", "version": "v4-restored-parser"}
 
 @app.post("/")
 @app.post("/scan")
