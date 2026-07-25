@@ -215,7 +215,7 @@ def scan_skill(skill_text: str) -> List[str]:
 @app.get("/")
 @app.head("/")
 def read_root():
-    return {"status": "ok", "service": "skill-safety-scanner"}
+    return {"status": "ok", "service": "skill-safety-scanner", "version": "v3-custom-parser"}
 
 @app.post("/")
 @app.post("/scan")
